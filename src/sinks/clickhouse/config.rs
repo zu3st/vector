@@ -5,6 +5,7 @@ use super::{
     service::{ClickhouseRetryLogic, ClickhouseServiceRequestBuilder},
     sink::{ClickhouseSink, PartitionKey},
 };
+use crate::codecs::{EncodingConfigWithFraming, SinkType};
 use crate::{
     http::{Auth, HttpClient, MaybeAuth},
     sinks::{
@@ -15,7 +16,7 @@ use crate::{
 use http::{Request, StatusCode, Uri};
 use hyper::Body;
 use std::fmt;
-use vector_lib::codecs::{encoding::Framer, JsonSerializerConfig, NewlineDelimitedEncoderConfig};
+use vector_lib::codecs::encoding::Framer;
 
 /// Data format.
 ///
@@ -51,7 +52,7 @@ impl fmt::Display for Format {
 
 /// Configuration for the `clickhouse` sink.
 #[configurable_component(sink("clickhouse", "Deliver log data to a ClickHouse database."))]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct ClickhouseConfig {
     /// The endpoint of the ClickHouse server.
@@ -87,9 +88,8 @@ pub struct ClickhouseConfig {
     #[serde(default = "Compression::gzip_default")]
     pub compression: Compression,
 
-    #[configurable(derived)]
-    #[serde(default, skip_serializing_if = "crate::serde::is_default")]
-    pub encoding: Transformer,
+    #[serde(flatten)]
+    pub(super) encoding: EncodingConfigWithFraming,
 
     #[configurable(derived)]
     #[serde(default)]
@@ -114,7 +114,15 @@ pub struct ClickhouseConfig {
     pub acknowledgements: AcknowledgementsConfig,
 }
 
-impl_generate_config_from_default!(ClickhouseConfig);
+impl GenerateConfig for ClickhouseConfig {
+    fn generate_config() -> toml::Value {
+        toml::from_str(
+            r#"endpoint = "http://localhost:8123"
+            encoding.codec = "json""#,
+        )
+        .unwrap()
+    }
+}
 
 #[async_trait::async_trait]
 #[typetag::serde(name = "clickhouse")]
@@ -154,15 +162,13 @@ impl SinkConfig for ClickhouseConfig {
                 .expect("'default' should be a valid template")
         });
 
+        let transformer = self.encoding.transformer();
+        let (framer, serializer) = self.encoding.build(SinkType::MessageBased)?;
+        let encoder = Encoder::<Framer>::new(framer, serializer);
+
         let request_builder = ClickhouseRequestBuilder {
             compression: self.compression,
-            encoding: (
-                self.encoding.clone(),
-                Encoder::<Framer>::new(
-                    NewlineDelimitedEncoderConfig.build().into(),
-                    JsonSerializerConfig::default().build().into(),
-                ),
-            ),
+            encoding: (transformer, encoder),
         };
 
         let sink = ClickhouseSink::new(
@@ -180,7 +186,7 @@ impl SinkConfig for ClickhouseConfig {
     }
 
     fn input(&self) -> Input {
-        Input::log()
+        Input::new(self.encoding.config().1.input_type() & DataType::Log)
     }
 
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
